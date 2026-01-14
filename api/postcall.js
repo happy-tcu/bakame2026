@@ -1,131 +1,159 @@
-// /pages/api/postcall.js  (or /api/postcall route you are using)
-
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-  const SUPABASE_URL = process.env.SUPABASE_URL;
-  const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+  try {
+    const SUPABASE_URL = process.env.SUPABASE_URL;
+    const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
-  const body = req.body || {};
-
-  // ElevenLabs / Twilio may send different shapes; be defensive.
-  const caller_id = body.caller_id || body.callerId || body.from || null; // phone
-  const user_id = body.user_id || body.userId || body.user?.id || body.user?.user_id || null; // web
-  const conversation_id =
-    body.conversation_id ||
-    body.conversationId ||
-    body.conversation?.id ||
-    body.conversation?.conversation_id ||
-    null;
-
-  const agent_id = body.agent_id || body.agentId || body.agent?.id || null;
-
-  // Try to capture a usable summary (fallback to empty string).
-  const progress_summary =
-    body.progress_summary ||
-    body.summary ||
-    body.conversation_summary ||
-    body.conversation?.summary ||
-    body.call_summary ||
-    "";
-
-  // If neither id exists, nothing to link.
-  if (!caller_id && !user_id) {
-    return res.status(200).json({ ok: true, skipped: "no caller_id or user_id" });
-  }
-
-  const headers = {
-    apikey: SUPABASE_ANON_KEY,
-    Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-    "Content-Type": "application/json",
-  };
-
-  // 1) Find existing learner by caller_id OR user_id
-  const idField = caller_id ? "caller_id" : "user_id";
-  const idValue = caller_id || user_id;
-
-  const findLearnerUrl =
-    `${SUPABASE_URL}/rest/v1/learners?` +
-    `${idField}=eq.${encodeURIComponent(idValue)}` +
-    `&select=id&limit=1`;
-
-  let learner_id = null;
-
-  const findR = await fetch(findLearnerUrl, { headers });
-  if (findR.ok) {
-    const rows = await findR.json();
-    if (rows?.length) learner_id = rows[0].id;
-  }
-
-  // 2) If not found, create learner
-  if (!learner_id) {
-    const createLearnerUrl = `${SUPABASE_URL}/rest/v1/learners?select=id`;
-    const createPayload = {
-      caller_id: caller_id || null,
-      user_id: user_id || null,
-      channel_first: caller_id ? "phone" : "web",
-    };
-
-    const createR = await fetch(createLearnerUrl, {
-      method: "POST",
-      headers: { ...headers, Prefer: "return=representation" },
-      body: JSON.stringify(createPayload),
-    });
-
-    if (!createR.ok) {
-      const t = await createR.text();
-      return res.status(500).json({ ok: false, step: "create_learner", error: t });
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+      return res.status(500).json({ error: "Missing SUPABASE env vars" });
     }
 
-    const created = await createR.json();
-    learner_id = created?.[0]?.id;
-  }
+    // ElevenLabs may send different shapes; we support a few.
+    const body = req.body || {};
+    const caller_id =
+      body.caller_id ||
+      body.callerId ||
+      body?.twilio?.caller_id ||
+      body?.twilio?.from ||
+      null;
 
-  // 3) Insert a session row (minimal)
-  if (learner_id) {
-    const insertSessionUrl = `${SUPABASE_URL}/rest/v1/sessions`;
-    const sessionPayload = {
-      learner_id,
-      conversation_id,
-      agent_id,
-      channel: caller_id ? "phone" : "web",
-      started_at: body.started_at || body.startedAt || null,
-      ended_at: body.ended_at || body.endedAt || null,
-      duration_seconds: body.duration_seconds || body.durationSeconds || null,
-      ended_by: body.ended_by || body.endedBy || null,
-      primary_module: body.primary_module || null,
-      primary_topic: body.primary_topic || null,
-      topic_tags: body.topic_tags || null,
-    };
+    const user_id =
+      body.user_id ||
+      body.userId ||
+      body?.client_data?.user_id ||
+      body?.clientData?.user_id ||
+      null;
 
-    await fetch(insertSessionUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(sessionPayload),
-    });
+    const conversation_id =
+      body.conversation_id ||
+      body.conversationId ||
+      body?.conversation?.id ||
+      null;
 
-    // 4) Upsert learner_progress (rolling summary used by /api/init)
-    // learner_progress has PK = learner_id, so we can upsert with on_conflict=learner_id
-    const upsertProgressUrl =
-      `${SUPABASE_URL}/rest/v1/learner_progress?on_conflict=learner_id`;
+    // Minimal progress_summary for now (you can upgrade later)
+    const progress_summary =
+      body.progress_summary ||
+      body.progressSummary ||
+      body.summary ||
+      "Conversation completed.";
 
-    const progressPayload = {
-      learner_id,
-      last_call_at: new Date().toISOString(),
-      progress_summary: progress_summary || "",
-    };
+    const last_call_at = new Date().toISOString();
 
-    const progR = await fetch(upsertProgressUrl, {
-      method: "POST",
-      headers: { ...headers, Prefer: "resolution=merge-duplicates" },
-      body: JSON.stringify(progressPayload),
-    });
+    // IMPORTANT:
+    // You created BOTH a table `public.calls` earlier AND later a VIEW named `public.calls`.
+    // If `public.calls` is now a VIEW, writes to /rest/v1/calls will fail.
+    // So write to the REAL table: `learner_progress` + `learners`.
+    //
+    // We will:
+    // 1) upsert learner into `learners` (by caller_id or user_id)
+    // 2) upsert progress into `learner_progress`
 
-    if (!progR.ok) {
-      const t = await progR.text();
-      return res.status(500).json({ ok: false, step: "upsert_progress", error: t });
+    // 1) Find existing learner
+    let learner = null;
+
+    if (caller_id) {
+      const find = await fetch(
+        `${SUPABASE_URL}/rest/v1/learners?caller_id=eq.${encodeURIComponent(
+          caller_id
+        )}&select=id`,
+        {
+          headers: {
+            apikey: SUPABASE_ANON_KEY,
+            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          },
+        }
+      );
+      const rows = find.ok ? await find.json() : [];
+      learner = rows?.[0] || null;
     }
-  }
 
-  return res.status(200).json({ ok: true });
+    if (!learner && user_id) {
+      const find = await fetch(
+        `${SUPABASE_URL}/rest/v1/learners?user_id=eq.${encodeURIComponent(
+          user_id
+        )}&select=id`,
+        {
+          headers: {
+            apikey: SUPABASE_ANON_KEY,
+            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          },
+        }
+      );
+      const rows = find.ok ? await find.json() : [];
+      learner = rows?.[0] || null;
+    }
+
+    // 2) Create learner if missing
+    if (!learner) {
+      const create = await fetch(`${SUPABASE_URL}/rest/v1/learners`, {
+        method: "POST",
+        headers: {
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          "Content-Type": "application/json",
+          Prefer: "return=representation",
+        },
+        body: JSON.stringify({
+          caller_id: caller_id || null,
+          user_id: user_id || null,
+          channel_first: caller_id ? "phone" : "web",
+        }),
+      });
+
+      if (!create.ok) {
+        const t = await create.text();
+        return res.status(500).json({ error: "Failed to create learner", detail: t });
+      }
+
+      const created = await create.json();
+      learner = created?.[0] || null;
+    }
+
+    // 3) Upsert learner_progress
+    // We need "Prefer: resolution=merge-duplicates" so it upserts on PK (learner_id).
+    const upsert = await fetch(`${SUPABASE_URL}/rest/v1/learner_progress`, {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "resolution=merge-duplicates,return=representation",
+      },
+      body: JSON.stringify({
+        learner_id: learner.id,
+        last_call_at,
+        progress_summary,
+      }),
+    });
+
+    if (!upsert.ok) {
+      const t = await upsert.text();
+      return res.status(500).json({ error: "Failed to upsert learner_progress", detail: t });
+    }
+
+    // Optional: store a session row (minimal)
+    if (conversation_id) {
+      await fetch(`${SUPABASE_URL}/rest/v1/sessions`, {
+        method: "POST",
+        headers: {
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          "Content-Type": "application/json",
+          Prefer: "return=minimal",
+        },
+        body: JSON.stringify({
+          learner_id: learner.id,
+          conversation_id,
+          channel: caller_id ? "phone" : "web",
+          ended_at: last_call_at,
+          ended_by: "client",
+        }),
+      });
+    }
+
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ error: "Server error", detail: String(e) });
+  }
 }
