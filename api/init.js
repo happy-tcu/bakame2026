@@ -9,7 +9,9 @@ export default async function handler(req, res) {
   let user_name = "friend";
 
   if (caller_id) {
-    const url = `${SUPABASE_URL}/rest/v1/calls?caller_id=eq.${encodeURIComponent(caller_id)}&select=progress_summary`;
+    const url = `${SUPABASE_URL}/rest/v1/calls?caller_id=eq.${encodeURIComponent(
+      caller_id
+    )}&select=progress_summary`;
 
     const r = await fetch(url, {
       headers: {
@@ -26,6 +28,10 @@ export default async function handler(req, res) {
 
   return res.status(200).json({
     type: "conversation_initiation_client_data",
-    dynamic_variables: { user_name, progress },
+    dynamic_variables: {
+      user_name,
+      progress,
+      caller_id
+    },
   });
 }
