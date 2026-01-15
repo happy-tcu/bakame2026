@@ -1,14 +1,25 @@
-export default async function handler(req, res) {
+module.exports = async function handler(req, res) {
   if (req.method !== "POST") {
-    return res.status(405).send("Method Not Allowed");
+    res.statusCode = 405;
+    return res.end("Method Not Allowed");
   }
 
-  console.log("RAW WEBHOOK BODY:", JSON.stringify(req.body, null, 2));
+  try {
+    const SUPABASE_URL = process.env.SUPABASE_URL;
+    const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
-  return res.status(200).json({ ok: true });
-}
-    // ElevenLabs may send different shapes; we support a few.
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+      res.statusCode = 500;
+      res.setHeader("Content-Type", "application/json");
+      return res.end(
+        JSON.stringify({ error: "Missing SUPABASE_URL or SUPABASE_ANON_KEY" })
+      );
+    }
+
     const body = req.body || {};
+    console.log("RAW WEBHOOK BODY:", JSON.stringify(body, null, 2));
+
+    // Accept multiple payload shapes
     const caller_id =
       body.caller_id ||
       body.callerId ||
@@ -29,7 +40,6 @@ export default async function handler(req, res) {
       body?.conversation?.id ||
       null;
 
-    // Minimal progress_summary for now (you can upgrade later)
     const progress_summary =
       body.progress_summary ||
       body.progressSummary ||
@@ -38,52 +48,31 @@ export default async function handler(req, res) {
 
     const last_call_at = new Date().toISOString();
 
-    // IMPORTANT:
-    // You created BOTH a table `public.calls` earlier AND later a VIEW named `public.calls`.
-    // If `public.calls` is now a VIEW, writes to /rest/v1/calls will fail.
-    // So write to the REAL table: `learner_progress` + `learners`.
-    //
-    // We will:
-    // 1) upsert learner into `learners` (by caller_id or user_id)
-    // 2) upsert progress into `learner_progress`
+    // ---------- 1) find or create learner ----------
+    let learnerId = null;
 
-    // 1) Find existing learner
-    let learner = null;
+    async function findLearnerBy(field, value) {
+      const url =
+        `${SUPABASE_URL}/rest/v1/learners?` +
+        `${field}=eq.${encodeURIComponent(value)}` +
+        `&select=id&limit=1`;
 
-    if (caller_id) {
-      const find = await fetch(
-        `${SUPABASE_URL}/rest/v1/learners?caller_id=eq.${encodeURIComponent(
-          caller_id
-        )}&select=id`,
-        {
-          headers: {
-            apikey: SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-          },
-        }
-      );
-      const rows = find.ok ? await find.json() : [];
-      learner = rows?.[0] || null;
+      const r = await fetch(url, {
+        headers: {
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        },
+      });
+
+      if (!r.ok) return null;
+      const rows = await r.json();
+      return rows?.[0]?.id || null;
     }
 
-    if (!learner && user_id) {
-      const find = await fetch(
-        `${SUPABASE_URL}/rest/v1/learners?user_id=eq.${encodeURIComponent(
-          user_id
-        )}&select=id`,
-        {
-          headers: {
-            apikey: SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-          },
-        }
-      );
-      const rows = find.ok ? await find.json() : [];
-      learner = rows?.[0] || null;
-    }
+    if (caller_id) learnerId = await findLearnerBy("caller_id", caller_id);
+    if (!learnerId && user_id) learnerId = await findLearnerBy("user_id", user_id);
 
-    // 2) Create learner if missing
-    if (!learner) {
+    if (!learnerId) {
       const create = await fetch(`${SUPABASE_URL}/rest/v1/learners`, {
         method: "POST",
         headers: {
@@ -100,37 +89,46 @@ export default async function handler(req, res) {
       });
 
       if (!create.ok) {
-        const t = await create.text();
-        return res.status(500).json({ error: "Failed to create learner", detail: t });
+        const detail = await create.text();
+        res.statusCode = 500;
+        res.setHeader("Content-Type", "application/json");
+        return res.end(JSON.stringify({ error: "Failed to create learner", detail }));
       }
 
       const created = await create.json();
-      learner = created?.[0] || null;
+      learnerId = created?.[0]?.id || null;
     }
 
-    // 3) Upsert learner_progress
-    // We need "Prefer: resolution=merge-duplicates" so it upserts on PK (learner_id).
+    if (!learnerId) {
+      res.statusCode = 500;
+      res.setHeader("Content-Type", "application/json");
+      return res.end(JSON.stringify({ error: "Could not resolve learnerId" }));
+    }
+
+    // ---------- 2) upsert learner_progress ----------
     const upsert = await fetch(`${SUPABASE_URL}/rest/v1/learner_progress`, {
       method: "POST",
       headers: {
         apikey: SUPABASE_ANON_KEY,
         Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
         "Content-Type": "application/json",
-        Prefer: "resolution=merge-duplicates,return=representation",
+        Prefer: "resolution=merge-duplicates,return=minimal",
       },
       body: JSON.stringify({
-        learner_id: learner.id,
+        learner_id: learnerId,
         last_call_at,
         progress_summary,
       }),
     });
 
     if (!upsert.ok) {
-      const t = await upsert.text();
-      return res.status(500).json({ error: "Failed to upsert learner_progress", detail: t });
+      const detail = await upsert.text();
+      res.statusCode = 500;
+      res.setHeader("Content-Type", "application/json");
+      return res.end(JSON.stringify({ error: "Failed to upsert learner_progress", detail }));
     }
 
-    // Optional: store a session row (minimal)
+    // ---------- 3) optional: store session ----------
     if (conversation_id) {
       await fetch(`${SUPABASE_URL}/rest/v1/sessions`, {
         method: "POST",
@@ -141,7 +139,7 @@ export default async function handler(req, res) {
           Prefer: "return=minimal",
         },
         body: JSON.stringify({
-          learner_id: learner.id,
+          learner_id: learnerId,
           conversation_id,
           channel: caller_id ? "phone" : "web",
           ended_at: last_call_at,
@@ -150,8 +148,12 @@ export default async function handler(req, res) {
       });
     }
 
-    return res.status(200).json({ ok: true });
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json");
+    return res.end(JSON.stringify({ ok: true }));
   } catch (e) {
-    return res.status(500).json({ error: "Server error", detail: String(e) });
+    res.statusCode = 500;
+    res.setHeader("Content-Type", "application/json");
+    return res.end(JSON.stringify({ error: "Server error", detail: String(e) }));
   }
-}
+};
