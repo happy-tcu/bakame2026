@@ -1,5 +1,13 @@
 // Vercel Serverless Function
 // POST /api/postcall
+
+// Fallback fetch for Node runtimes where global fetch isn't available
+const fetchFn =
+  typeof fetch === "function"
+    ? fetch
+    : (...args) =>
+        import("node-fetch").then(({ default: f }) => f(...args));
+
 module.exports = async function handler(req, res) {
   try {
     if (req.method !== "POST") {
@@ -62,7 +70,7 @@ module.exports = async function handler(req, res) {
 
     // ---------- Supabase helpers ----------
     async function supabaseGET(path) {
-      const r = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+      const r = await fetchFn(`${SUPABASE_URL}/rest/v1/${path}`, {
         headers: {
           apikey: SUPABASE_SERVICE_ROLE_KEY,
           Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
@@ -77,7 +85,7 @@ module.exports = async function handler(req, res) {
     }
 
     async function supabasePOST(path, payload, prefer) {
-      const r = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+      const r = await fetchFn(`${SUPABASE_URL}/rest/v1/${path}`, {
         method: "POST",
         headers: {
           apikey: SUPABASE_SERVICE_ROLE_KEY,
@@ -127,6 +135,7 @@ module.exports = async function handler(req, res) {
         return res.status(500).json({
           error: "Failed to create learner",
           detail: created.text,
+          status: created.status,
         });
       }
 
@@ -148,6 +157,7 @@ module.exports = async function handler(req, res) {
       return res.status(500).json({
         error: "Failed to upsert learner_progress",
         detail: progress.text,
+        status: progress.status,
       });
     }
 
@@ -170,6 +180,7 @@ module.exports = async function handler(req, res) {
         return res.status(500).json({
           error: "Failed to upsert session_transcripts",
           detail: transcriptUpsert.text,
+          status: transcriptUpsert.status,
         });
       }
     }
