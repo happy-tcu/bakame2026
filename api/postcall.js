@@ -5,8 +5,7 @@
 const fetchFn =
   typeof fetch === "function"
     ? fetch
-    : (...args) =>
-        import("node-fetch").then(({ default: f }) => f(...args));
+    : (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
 module.exports = async function handler(req, res) {
   try {
@@ -43,12 +42,16 @@ module.exports = async function handler(req, res) {
       body?.user?.id ||
       null;
 
+    // ---------- Conversation ID (with fallback so we ALWAYS write a row) ----------
     const conversation_id =
       body.conversation_id ||
       body.conversationId ||
       body?.conversation?.id ||
       body?.conversation?.conversation_id ||
-      null;
+      body?.call?.id ||
+      body?.call_sid ||
+      body?.twilio?.call_sid ||
+      `${caller_id || user_id || "unknown"}-${nowIso}`;
 
     // ---------- Transcript + summary ----------
     const transcript =
@@ -161,34 +164,32 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // ---------- 3) Upsert session_transcripts ----------
-    if (conversation_id) {
-      const transcriptUpsert = await supabasePOST(
-        "session_transcripts",
-        {
-          conversation_id,
-          learner_id: learner.id,
-          channel: caller_id ? "phone" : "web",
-          ended_at: nowIso,
-          transcript: transcript,
-          summary: summary,
-        },
-        "resolution=merge-duplicates,return=representation"
-      );
+    // ---------- 3) Upsert session_transcripts (ALWAYS) ----------
+    const transcriptUpsert = await supabasePOST(
+      "session_transcripts",
+      {
+        conversation_id,
+        learner_id: learner.id,
+        channel: caller_id ? "phone" : "web",
+        ended_at: nowIso,
+        transcript: transcript,
+        summary: summary,
+      },
+      "resolution=merge-duplicates,return=representation"
+    );
 
-      if (!transcriptUpsert.ok) {
-        return res.status(500).json({
-          error: "Failed to upsert session_transcripts",
-          detail: transcriptUpsert.text,
-          status: transcriptUpsert.status,
-        });
-      }
+    if (!transcriptUpsert.ok) {
+      return res.status(500).json({
+        error: "Failed to upsert session_transcripts",
+        detail: transcriptUpsert.text,
+        status: transcriptUpsert.status,
+      });
     }
 
     return res.status(200).json({
       ok: true,
       learner_id: learner.id,
-      conversation_id: conversation_id || null,
+      conversation_id,
       transcript_saved: Boolean(transcript),
     });
   } catch (e) {
