@@ -245,6 +245,9 @@ module.exports = async function handler(req, res) {
       });
     }
 
+    console.log("TRANSCRIPT KEYS:", Object.keys(body || {}));
+console.log("TRANSCRIPT VALUE LEN:", transcript ? transcript.length : 0);
+
     // ---------- 3) Upsert session_transcripts (ALWAYS) ----------
     const transcriptUpsert = await supabasePOST(
       "session_transcripts",
