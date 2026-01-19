@@ -16,6 +16,9 @@ module.exports = async function handler(req, res) {
     const SUPABASE_URL = process.env.SUPABASE_URL;
     const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
+    // HubSpot (Private App) token
+    const HUBSPOT_PRIVATE_APP_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN;
+
     if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
       return res.status(500).json({
         error: "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY",
@@ -106,6 +109,84 @@ module.exports = async function handler(req, res) {
       };
     }
 
+    // ---------- HubSpot helpers ----------
+    async function hubspotRequest(path, { method = "GET", body } = {}) {
+      if (!HUBSPOT_PRIVATE_APP_TOKEN) {
+        return { ok: false, status: 500, text: "Missing HUBSPOT_PRIVATE_APP_TOKEN" };
+      }
+
+      const r = await fetchFn(`https://api.hubapi.com${path}`, {
+        method,
+        headers: {
+          Authorization: `Bearer ${HUBSPOT_PRIVATE_APP_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+
+      return {
+        ok: r.ok,
+        status: r.status,
+        json: r.ok ? await r.json() : null,
+        text: r.ok ? null : await r.text(),
+      };
+    }
+
+    async function hubspotFindContactIdByPhone(phone) {
+      if (!phone) return null;
+
+      const search = await hubspotRequest("/crm/v3/objects/contacts/search", {
+        method: "POST",
+        body: {
+          filterGroups: [
+            {
+              filters: [
+                {
+                  propertyName: "phone",
+                  operator: "EQ",
+                  value: phone,
+                },
+              ],
+            },
+          ],
+          properties: ["phone"],
+          limit: 1,
+        },
+      });
+
+      if (search.ok && search.json?.results?.length) {
+        return search.json.results[0].id;
+      }
+      return null;
+    }
+
+    async function hubspotCreateContact({ phone }) {
+      const created = await hubspotRequest("/crm/v3/objects/contacts", {
+        method: "POST",
+        body: {
+          properties: {
+            phone: phone || "",
+          },
+        },
+      });
+
+      if (created.ok) return created.json?.id || null;
+      return null;
+    }
+
+    async function hubspotUpdateContact(contactId, { phone }) {
+      return hubspotRequest(`/crm/v3/objects/contacts/${contactId}`, {
+        method: "PATCH",
+        body: {
+          properties: {
+            phone: phone || "",
+            // Optional later:
+            // lifecyclestage: "lead",
+          },
+        },
+      });
+    }
+
     // ---------- 1) Find or create learner ----------
     let learner = null;
 
@@ -186,11 +267,26 @@ module.exports = async function handler(req, res) {
       });
     }
 
+    // ---------- 4) HubSpot: find-or-create contact ----------
+    let hubspot_contact_id = null;
+
+    // Only attempt HubSpot if we have a phone and a token
+    if (caller_id && HUBSPOT_PRIVATE_APP_TOKEN) {
+      hubspot_contact_id = await hubspotFindContactIdByPhone(caller_id);
+
+      if (!hubspot_contact_id) {
+        hubspot_contact_id = await hubspotCreateContact({ phone: caller_id });
+      } else {
+        await hubspotUpdateContact(hubspot_contact_id, { phone: caller_id });
+      }
+    }
+
     return res.status(200).json({
       ok: true,
       learner_id: learner.id,
       conversation_id,
       transcript_saved: Boolean(transcript),
+      hubspot_contact_id,
     });
   } catch (e) {
     return res.status(500).json({
