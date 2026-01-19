@@ -271,7 +271,7 @@ module.exports = async function handler(req, res) {
     let hubspot_contact_id = null;
 
     // Only attempt HubSpot if we have a phone and a token
-    if (caller_id && HUBSPOT_PRIVATE_APP_TOKEN) {
+   if ((caller_id || user_id) && HUBSPOT_PRIVATE_APP_TOKEN) {
       hubspot_contact_id = await hubspotFindContactIdByPhone(caller_id);
 
       if (!hubspot_contact_id) {
